@@ -1,0 +1,216 @@
+x-celery-worker-base: &celery-worker-base
+  build: .
+  environment:
+    APP_ENV: local
+    DATABASE_URL: postgresql+psycopg://primmo:primmo@postgres:5432/primmo
+    REDIS_URL: redis://redis:6379/0
+    MINIO_ENDPOINT: http://minio:9000
+    MINIO_PUBLIC_ENDPOINT: http://127.0.0.1:9000
+    MINIO_ACCESS_KEY: minioadmin
+    MINIO_SECRET_KEY: minioadmin
+    MINIO_BUCKET: primmo-documents
+    MAX_UPLOAD_SIZE_BYTES: 20971520
+    UPLOAD_URL_EXPIRES_SECONDS: 300
+    JWT_SECRET: local-dev-secret-change-me-32-bytes
+    JWT_EXPIRES_MINUTES: 60
+    PARTNER_HMAC_SECRET: local-partner-secret-change-me
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  volumes:
+    - ./app:/app/app
+    - ./alembic.ini:/app/alembic.ini
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: primmo
+      POSTGRES_USER: primmo
+      POSTGRES_PASSWORD: primmo
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U primmo -d primmo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  flower:
+    build: .
+    environment:
+      APP_ENV: local
+      DATABASE_URL: postgresql+psycopg://primmo:primmo@postgres:5432/primmo
+      REDIS_URL: redis://redis:6379/0
+    command: celery -A app.celery_app:celery_app --broker=redis://redis:6379/0 flower --port=5555 --persistent=True --db=/data/flower.db
+    ports:
+      - "5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./app:/app/app
+      - ./alembic.ini:/app/alembic.ini
+      - flower_data:/data
+
+  minio:
+    image: minio/minio:latest
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done
+        mc mb --ignore-existing local/primmo-documents
+        mc anonymous set none local/primmo-documents
+
+  api:
+    build: .
+    environment:
+      APP_ENV: local
+      DATABASE_URL: postgresql+psycopg://primmo:primmo@postgres:5432/primmo
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_PUBLIC_ENDPOINT: http://127.0.0.1:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: primmo-documents
+      MAX_UPLOAD_SIZE_BYTES: 20971520
+      UPLOAD_URL_EXPIRES_SECONDS: 300
+      JWT_SECRET: local-dev-secret-change-me-32-bytes
+      JWT_EXPIRES_MINUTES: 60
+      PARTNER_HMAC_SECRET: local-partner-secret-change-me
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./app:/app/app
+      - ./alembic.ini:/app/alembic.ini
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  admin:
+    build: .
+    environment:
+      APP_ENV: local
+      DATABASE_URL: postgresql+psycopg://primmo:primmo@postgres:5432/primmo
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./app:/app/app
+      - ./alembic.ini:/app/alembic.ini
+    command: flask --app app.modules.admin.app:app run --host 0.0.0.0 --port 8001 --debug
+
+  worker-pipeline:
+    <<: *celery-worker-base
+    hostname: worker-pipeline
+    command: celery -A app.celery_app:celery_app worker -n worker-pipeline@%h -Q documents.pipeline --loglevel=INFO
+
+  worker-ocr:
+    <<: *celery-worker-base
+    hostname: worker-ocr
+    command: celery -A app.celery_app:celery_app worker -n worker-ocr@%h -Q documents.ocr --loglevel=INFO
+
+  worker-metadata:
+    <<: *celery-worker-base
+    hostname: worker-metadata
+    command: celery -A app.celery_app:celery_app worker -n worker-metadata@%h -Q documents.metadata --loglevel=INFO
+
+  worker-chunking:
+    <<: *celery-worker-base
+    hostname: worker-chunking
+    command: celery -A app.celery_app:celery_app worker -n worker-chunking@%h -Q documents.chunking --loglevel=INFO
+
+  worker-external-call:
+    <<: *celery-worker-base
+    hostname: worker-external-call
+    command: celery -A app.celery_app:celery_app worker -n worker-external-call@%h -Q documents.external_call --loglevel=INFO
+
+  worker-recovery:
+    <<: *celery-worker-base
+    hostname: worker-recovery
+    command: celery -A app.celery_app:celery_app worker -n worker-recovery@%h -Q documents.recovery --loglevel=INFO
+
+  beat:
+    build: .
+    environment:
+      APP_ENV: local
+      DATABASE_URL: postgresql+psycopg://primmo:primmo@postgres:5432/primmo
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./app:/app/app
+      - ./alembic.ini:/app/alembic.ini
+      - celerybeat_data:/data
+    command: celery -A app.celery_app:celery_app beat --loglevel=INFO --schedule=/data/celerybeat-schedule
+
+  metabase:
+    image: metabase/metabase:latest
+    environment:
+      MB_DB_FILE: /metabase-data/metabase.db
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - metabase_data:/metabase-data
+
+  front:
+    build:
+      context: ./front
+    ports:
+      - "8080:80"
+    depends_on:
+      api:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  flower_data:
+  minio_data:
+  metabase_data:
+  celerybeat_data:
